@@ -43,19 +43,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn exec(args: &[String]) -> anyhow::Result<()> {
-    let c_string_command = CString::new(args[0].clone()).unwrap();
     // https://man7.org/linux/man-pages/man3/exec.3.html
     // The first argument, by convention, should point to the filename associated with the file being executed.
-    let args2 = args[0..].to_vec();
-    let mut args2_c_string = Vec::new();
-    for arg in args2 {
-        args2_c_string.push(CString::new(arg).unwrap());
-    }
-    let mut args2_c_str = Vec::new();
-    for arg in args2_c_string.iter() {
-        args2_c_str.push(arg.as_c_str());
-    }
-    unistd::execv(c_string_command.as_c_str(), &args2_c_str).expect("exec got error");
+    let args: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+    unistd::execv(&args[0], &args).expect("exec got error");
     Ok(())
 }
 
