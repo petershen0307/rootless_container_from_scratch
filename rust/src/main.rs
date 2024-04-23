@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Ok};
 use nix::sched::CloneFlags;
 use nix::sys::signal::Signal;
-use nix::{sched, unistd};
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::unistd::Pid;
+use nix::{sched, sys, unistd};
 use tracing::{debug, info, Level};
 
 // prun run <command> <args>
@@ -83,7 +85,15 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                 | CloneFlags::CLONE_NEWNS,
             Some(Signal::SIGCHLD as i32),
         )
-        .expect("can't run process");
+        .context("can't clone process")?;
     }
+    // wait all children process stop
+    while let WaitStatus::StillAlive =
+        sys::wait::waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
+            .context("wait child process failed")?
+    {
+        thread::sleep(Duration::from_secs(1));
+    }
+    info!("leave");
     Ok(())
 }
