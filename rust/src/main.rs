@@ -1,7 +1,9 @@
 use std::ffi::CString;
 use std::process::{self};
+use std::thread;
+use std::time::Duration;
 
-use anyhow::Ok;
+use anyhow::{Context, Ok};
 use nix::sched::CloneFlags;
 use nix::sys::signal::Signal;
 use nix::{sched, unistd};
@@ -15,7 +17,15 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = std::env::args().collect::<Vec<String>>();
     anyhow::ensure!(args.len() > 1, "incorrect parameter");
-    info!("pid:{}", process::id());
+    info!(
+        "pid={}, user id={}, hostname={}",
+        unistd::getpid(),
+        unistd::getuid(),
+        unistd::gethostname()
+            .expect("get hostname")
+            .into_string()
+            .expect("convert OsString to String")
+    );
     match args[1].to_lowercase().as_str() {
         "run" => {
             run(&args[2..])?;
@@ -53,7 +63,16 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     unsafe {
         sched::clone(
             Box::new(|| -> isize {
-                info!("sched::clone pid:{}", process::id());
+                unistd::sethostname("container").expect("set hostname failed");
+                info!(
+                    "sched::clone pid={}, user id={}, hostname={}",
+                    unistd::getpid(),
+                    unistd::getuid(),
+                    unistd::gethostname()
+                        .expect("get hostname")
+                        .into_string()
+                        .expect("convert OsString to String")
+                );
                 exec(args).unwrap();
                 0
             }),
