@@ -1,9 +1,8 @@
 use std::ffi::CString;
-use std::process::{self};
-use std::thread;
 use std::time::Duration;
+use std::{env, path, thread};
 
-use anyhow::{Context, Ok};
+use anyhow::Context;
 use nix::sched::CloneFlags;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
@@ -18,7 +17,7 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(Level::TRACE)
         .init();
     let args = std::env::args().collect::<Vec<String>>();
-    anyhow::ensure!(args.len() > 1, "incorrect parameter");
+    anyhow::ensure!(args.len() > 1, "prun [run|exec]");
     info!(
         "pid={}, user id={}, hostname={}",
         unistd::getpid(),
@@ -30,9 +29,11 @@ fn main() -> anyhow::Result<()> {
     );
     match args[1].to_lowercase().as_str() {
         "run" => {
-            run(&args[2..])?;
+            anyhow::ensure!(args.len() > 3, "prun run <image> <command> <args>");
+            run(&args[2], &args[3..])?;
         }
         "exec" => {
+            anyhow::ensure!(args.len() > 2, "prun exec <command> <args>");
             exec(&args[2..])?;
         }
         _ => {
@@ -53,12 +54,19 @@ fn exec(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run(args: &[String]) -> anyhow::Result<()> {
+fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
+    let fs_root = resolve_image_path(image)?;
+    debug!("fs_root={}", fs_root);
     const STACK_SIZE: usize = 1024 * 1024;
     let stack: &mut [u8; STACK_SIZE] = &mut [0; STACK_SIZE];
     unsafe {
         sched::clone(
             Box::new(|| -> isize {
+                // setup root dir
+                unistd::chroot(fs_root.as_str()).expect("set root dir failed");
+                // setup current directory to root
+                unistd::chdir("/").expect("set current dir failed");
+                // setup hostname
                 unistd::sethostname("container").expect("set hostname failed");
                 info!(
                     "sched::clone pid={}, user id={}, hostname={}",
@@ -69,6 +77,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                         .into_string()
                         .expect("convert OsString to String")
                 );
+                // execute process
                 exec(args).unwrap();
                 0
             }),
@@ -90,4 +99,17 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     }
     info!("leave");
     Ok(())
+}
+
+fn resolve_image_path(image: &String) -> anyhow::Result<String> {
+    let fs_root = env::var("FS_ROOT").unwrap_or("/home/peter/filesystem".to_string());
+    if let Ok(fs_root) = path::Path::new(&fs_root)
+        .join(image)
+        .into_os_string()
+        .into_string()
+    {
+        Ok(fs_root)
+    } else {
+        anyhow::bail!("convert osstring to string failed")
+    }
 }
