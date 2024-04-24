@@ -49,7 +49,7 @@ fn exec(args: &[String]) -> anyhow::Result<()> {
         .iter()
         .map(|s| CString::new(s.as_str()).unwrap())
         .collect();
-    unistd::execv(&args[0], &args).expect("exec got error");
+    unistd::execvp(&args[0], &args).expect("exec got error");
     Ok(())
 }
 
