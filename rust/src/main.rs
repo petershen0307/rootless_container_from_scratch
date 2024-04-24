@@ -1,13 +1,14 @@
 use std::ffi::CString;
+use std::io::Write;
 use std::time::Duration;
-use std::{env, path, thread};
+use std::{env, fs, path, thread};
 
 use anyhow::Context;
 use nix::sched::CloneFlags;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
-use nix::{sched, sys, unistd};
+use nix::unistd::{Gid, Pid, Uid};
+use nix::{mount, sched, sys, unistd};
 use tracing::{debug, info, Level};
 
 // prun run <command> <args>
@@ -59,7 +60,7 @@ fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
     debug!("fs_root={}", fs_root);
     const STACK_SIZE: usize = 1024 * 1024;
     let stack: &mut [u8; STACK_SIZE] = &mut [0; STACK_SIZE];
-    unsafe {
+    let child_pid = unsafe {
         sched::clone(
             Box::new(|| -> isize {
                 // setup root dir
@@ -68,6 +69,15 @@ fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
                 unistd::chdir("/").expect("set current dir failed");
                 // setup hostname
                 unistd::sethostname("container").expect("set hostname failed");
+                // mount proc
+                mount::mount(
+                    Some("proc"),
+                    "proc",
+                    Some("proc"),
+                    mount::MsFlags::empty(),
+                    Option::<&'static [u8]>::None,
+                )
+                .expect("mount failed");
                 info!(
                     "sched::clone pid={}, user id={}, hostname={}",
                     unistd::getpid(),
@@ -88,8 +98,11 @@ fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
                 | CloneFlags::CLONE_NEWNS,
             Some(Signal::SIGCHLD as i32),
         )
-        .context("can't clone process")?;
-    }
+        .context("can't clone process")?
+    };
+    info!("child pid={}", child_pid);
+    adjust_uid_map(child_pid, unistd::getuid())?;
+    //adjust_gid_map(child_pid, unistd::getgid())?;
     // wait all children process stop
     while let WaitStatus::StillAlive =
         sys::wait::waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
@@ -112,4 +125,34 @@ fn resolve_image_path(image: &String) -> anyhow::Result<String> {
     } else {
         anyhow::bail!("convert osstring to string failed")
     }
+}
+
+fn adjust_uid_map(pid: Pid, host_uid: Uid) -> anyhow::Result<()> {
+    let uid_map_path = format!("/proc/{pid}/uid_map");
+    info!("uid_map={uid_map_path}");
+    let mut uid_map_file = fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&uid_map_path)?;
+    // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
+    // content {the uid for pid's namespace} {host uid} {uid length}
+    let content = format!("0 {host_uid} 1");
+    uid_map_file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+fn adjust_gid_map(pid: Pid, host_gid: Gid) -> anyhow::Result<()> {
+    let gid_map_path = format!("/proc/{pid}/gid_map");
+    info!("gid_map={gid_map_path}");
+    let mut gid_map_file = fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&gid_map_path)?;
+    // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
+    // content {the gid for pid's namespace} {host gid} {gid length}
+    let content = format!("0 {host_gid} 1");
+    gid_map_file.write_all(content.as_bytes())?;
+    Ok(())
 }
