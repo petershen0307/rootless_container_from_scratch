@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::io::Write;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 use std::{env, fs, path, thread};
 
@@ -58,51 +59,12 @@ fn exec(args: &[String]) -> anyhow::Result<()> {
 fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
     let fs_root = resolve_image_path(image)?;
     debug!("fs_root={}", fs_root);
-    const STACK_SIZE: usize = 1024 * 1024;
-    let stack: &mut [u8; STACK_SIZE] = &mut [0; STACK_SIZE];
-    let child_pid = unsafe {
-        sched::clone(
-            Box::new(|| -> isize {
-                // setup root dir
-                unistd::chroot(fs_root.as_str()).expect("set root dir failed");
-                // setup current directory to root
-                unistd::chdir("/").expect("set current dir failed");
-                // setup hostname
-                unistd::sethostname("container").expect("set hostname failed");
-                // mount proc
-                mount::mount(
-                    Some("proc"),
-                    "proc",
-                    Some("proc"),
-                    mount::MsFlags::empty(),
-                    Option::<&'static [u8]>::None,
-                )
-                .expect("mount failed");
-                info!(
-                    "sched::clone pid={}, user id={}, hostname={}",
-                    unistd::getpid(),
-                    unistd::getuid(),
-                    unistd::gethostname()
-                        .expect("get hostname")
-                        .into_string()
-                        .expect("convert OsString to String")
-                );
-                // execute process
-                exec(args).unwrap();
-                0
-            }),
-            stack,
-            CloneFlags::CLONE_NEWUSER
-                | CloneFlags::CLONE_NEWUTS
-                | CloneFlags::CLONE_NEWPID
-                | CloneFlags::CLONE_NEWNS,
-            Some(Signal::SIGCHLD as i32),
-        )
-        .context("can't clone process")?
-    };
+    let (read_pipe, write_pipe) = unistd::pipe().expect("create pipe failed");
+    let child_pid = clone(args, &fs_root, read_pipe).expect("fork failed");
     info!("child pid={}", child_pid);
     adjust_uid_map(child_pid, unistd::getuid())?;
-    //adjust_gid_map(child_pid, unistd::getgid())?;
+    // adjust_gid_map(child_pid, unistd::getgid())?;
+    unistd::write(write_pipe, "go".as_bytes()).expect("write pipe failed");
     // wait all children process stop
     while let WaitStatus::StillAlive =
         sys::wait::waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
@@ -138,7 +100,9 @@ fn adjust_uid_map(pid: Pid, host_uid: Uid) -> anyhow::Result<()> {
     // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
     // content {the uid for pid's namespace} {host uid} {uid length}
     let content = format!("0 {host_uid} 1");
-    uid_map_file.write_all(content.as_bytes())?;
+    uid_map_file
+        .write_all(content.as_bytes())
+        .context("write uid failed")?;
     Ok(())
 }
 
@@ -153,6 +117,103 @@ fn adjust_gid_map(pid: Pid, host_gid: Gid) -> anyhow::Result<()> {
     // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
     // content {the gid for pid's namespace} {host gid} {gid length}
     let content = format!("0 {host_gid} 1");
-    gid_map_file.write_all(content.as_bytes())?;
+    gid_map_file
+        .write_all(content.as_bytes())
+        .context("write gid failed")?;
     Ok(())
+}
+
+fn clone(args: &[String], fs_root: &str, read_pipe: OwnedFd) -> anyhow::Result<Pid> {
+    const STACK_SIZE: usize = 1024 * 1024;
+    let stack: &mut [u8; STACK_SIZE] = &mut [0; STACK_SIZE];
+    let child_pid = unsafe {
+        sched::clone(
+            Box::new(|| -> isize {
+                let mut buf = [0; 1024];
+                unistd::read(read_pipe.as_raw_fd(), &mut buf).expect("read pipe failed");
+                // setup root dir
+                unistd::chroot(fs_root).expect("set root dir failed");
+                // setup current directory to root
+                unistd::chdir("/").expect("set current dir failed");
+                // setup hostname
+                unistd::sethostname("container").expect("set hostname failed");
+                // mount proc
+                mount::mount(
+                    Some("proc"),
+                    "proc",
+                    Some("proc"),
+                    mount::MsFlags::empty(),
+                    Option::<&'static [u8]>::None,
+                )
+                .expect("mount failed");
+                info!(
+                    "sched::clone pid={}, user id={}, hostname={}",
+                    unistd::getpid(),
+                    unistd::getuid(),
+                    unistd::gethostname()
+                        .expect("get hostname")
+                        .into_string()
+                        .expect("convert OsString to String")
+                );
+                // execute process
+                exec(args).unwrap();
+                0
+            }),
+            stack,
+            CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWUTS
+                | CloneFlags::CLONE_NEWPID
+                | CloneFlags::CLONE_NEWNS,
+            Some(Signal::SIGCHLD as i32),
+        )
+        .context("can't clone process")?
+    };
+    Ok(child_pid)
+}
+
+fn fork(args: &[String], fs_root: &str, read_pipe: OwnedFd) -> anyhow::Result<Pid> {
+    let child_pid;
+    unsafe {
+        let fork_result = unistd::fork().expect("fork failed");
+
+        child_pid = match fork_result {
+            unistd::ForkResult::Parent { child } => child,
+            _ => {
+                let mut buf = [0; 1024];
+                unistd::read(read_pipe.as_raw_fd(), &mut buf).expect("read pipe failed");
+                sched::unshare(CloneFlags::CLONE_NEWUSER).expect("unshare user namespace failed");
+                sched::unshare(CloneFlags::CLONE_NEWPID).expect("unshare pid namespace failed");
+                sched::unshare(CloneFlags::CLONE_NEWNS).expect("unshare mount namespace failed");
+                sched::unshare(CloneFlags::CLONE_NEWUTS).expect("unshare uts namespace failed");
+                // setup root dir
+                unistd::chroot(fs_root).expect("set root dir failed");
+                // setup current directory to root
+                unistd::chdir("/").expect("set current dir failed");
+                // setup hostname
+                unistd::sethostname("container").expect("set hostname failed");
+                // mount proc
+                mount::mount(
+                    Some("proc"),
+                    "proc",
+                    Some("proc"),
+                    mount::MsFlags::empty(),
+                    Option::<&'static [u8]>::None,
+                )
+                .expect("mount failed");
+                info!(
+                    "sched::clone pid={}, user id={}, hostname={}",
+                    unistd::getpid(),
+                    unistd::getuid(),
+                    unistd::gethostname()
+                        .expect("get hostname")
+                        .into_string()
+                        .expect("convert OsString to String")
+                );
+                // execute process
+                exec(args).unwrap();
+                Pid::from_raw(0)
+            }
+        }
+    }
+    Ok(child_pid)
 }
