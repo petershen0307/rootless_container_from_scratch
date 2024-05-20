@@ -63,7 +63,7 @@ fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
     let child_pid = clone(args, &fs_root, read_pipe).expect("fork failed");
     info!("child pid={}", child_pid);
     adjust_uid_map(child_pid, unistd::getuid())?;
-    // adjust_gid_map(child_pid, unistd::getgid())?;
+    adjust_gid_map(child_pid, unistd::getgid())?;
     unistd::write(write_pipe, "go".as_bytes()).expect("write pipe failed");
     // wait all children process stop
     while let WaitStatus::StillAlive =
@@ -107,6 +107,21 @@ fn adjust_uid_map(pid: Pid, host_uid: Uid) -> anyhow::Result<()> {
 }
 
 fn adjust_gid_map(pid: Pid, host_gid: Gid) -> anyhow::Result<()> {
+    // https://man7.org/linux/man-pages/man7/user_namespaces.7.html
+    // Writing "deny" to the /proc/pid/setgroups file before writing to
+    // /proc/pid/gid_map will permanently disable setgroups(2) in a user
+    // namespace and allow writing to /proc/pid/gid_map without having
+    // the CAP_SETGID capability in the parent user namespace.
+    let set_groups_path = format!("/proc/{pid}/setgroups");
+    info!("setgroups={set_groups_path}");
+    let mut set_groups_file = fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&set_groups_path)?;
+    set_groups_file
+        .write_all("deny".as_bytes())
+        .context("write gid failed")?;
     let gid_map_path = format!("/proc/{pid}/gid_map");
     info!("gid_map={gid_map_path}");
     let mut gid_map_file = fs::File::options()
