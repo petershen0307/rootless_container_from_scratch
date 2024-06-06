@@ -62,6 +62,7 @@ fn run(image: &String, args: &[String]) -> anyhow::Result<()> {
     let (read_pipe, write_pipe) = unistd::pipe().expect("create pipe failed");
     let child_pid = clone(args, &fs_root, read_pipe).expect("fork failed");
     info!("child pid={}", child_pid);
+    cgroup_memory(child_pid)?;
     adjust_uid_map(child_pid, unistd::getuid())?;
     adjust_gid_map(child_pid, unistd::getgid())?;
     unistd::write(write_pipe, "go".as_bytes()).expect("write pipe failed");
@@ -231,4 +232,18 @@ fn fork(args: &[String], fs_root: &str, read_pipe: OwnedFd) -> anyhow::Result<Pi
         }
     }
     Ok(child_pid)
+}
+
+fn cgroup_memory(controlled_pid: Pid) -> anyhow::Result<()> {
+    let new_cgroup_path = "/sys/fs/cgroup/memory/prun";
+    std::fs::create_dir_all(new_cgroup_path).expect("create cgroup failed");
+    let cgroup_procs_path = format!("{new_cgroup_path}/cgroup.procs");
+    let mut cgroup_procs_file = fs::File::options()
+        .create(true)
+        .append(true)
+        .open(cgroup_procs_path)?;
+    cgroup_procs_file
+        .write_all(controlled_pid.to_string().as_bytes())
+        .context("failed to write pid in cgroup")?;
+    Ok(())
 }
